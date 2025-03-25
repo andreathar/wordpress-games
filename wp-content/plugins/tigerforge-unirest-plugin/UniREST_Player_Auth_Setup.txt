@@ -1,0 +1,818 @@
+# UniREST Player Authentication System Setup
+
+This file contains all the necessary code and instructions to set up a complete player authentication system using UniREST in WordPress and Unity.
+
+## 1. Database Tables
+
+Run the following SQL in phpMyAdmin to create the necessary tables:
+
+```sql
+-- Create the players table
+CREATE TABLE tfur_players (
+    id INT(11) NOT NULL AUTO_INCREMENT,
+    username VARCHAR(50) NOT NULL,
+    email VARCHAR(100) NOT NULL,
+    password_hash VARCHAR(255) NOT NULL,
+    display_name VARCHAR(100),
+    registration_date DATETIME DEFAULT CURRENT_TIMESTAMP,
+    last_login DATETIME,
+    status ENUM('active', 'inactive', 'banned') DEFAULT 'active',
+    PRIMARY KEY (id),
+    UNIQUE KEY (username),
+    UNIQUE KEY (email)
+);
+
+-- Create the player sessions table
+CREATE TABLE tfur_player_sessions (
+    id INT(11) NOT NULL AUTO_INCREMENT,
+    player_id INT(11) NOT NULL,
+    session_token VARCHAR(255) NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    expires_at DATETIME,
+    last_activity DATETIME,
+    PRIMARY KEY (id),
+    FOREIGN KEY (player_id) REFERENCES tfur_players(id) ON DELETE CASCADE
+);
+```
+
+## 2. API Configuration
+
+Run the following SQL to create the API group and endpoints in the UniREST configuration:
+
+```sql
+-- Insert the API group
+INSERT INTO tfsur_apis (type, group_id, name, info, data2, data3, data4) 
+VALUES ('GRP', NULL, 'players', NULL, NULL, NULL, NULL);
+
+-- Get the API group ID
+SET @api_group_id = LAST_INSERT_ID();
+
+-- Insert the API endpoints
+INSERT INTO tfsur_apis (type, group_id, name, info, data2, data3, data4) 
+VALUES 
+('SQL', @api_group_id, 'register', '{"id":1,"name":"register","type":"SQL","tableName":"players"}', 
+'{"canRead":false,"canWrite":true,"canUpdate":false,"canDelete":false}', NULL, NULL),
+
+('SQL', @api_group_id, 'login', '{"id":2,"name":"login","type":"SQL","tableName":"players"}', 
+'{"canRead":true,"canWrite":false,"canUpdate":false,"canDelete":false}', NULL, NULL),
+
+('SQL', @api_group_id, 'validate', '{"id":3,"name":"validate","type":"SQL","tableName":"player_sessions"}', 
+'{"canRead":true,"canWrite":false,"canUpdate":false,"canDelete":false}', NULL, NULL),
+
+('SQL', @api_group_id, 'logout', '{"id":4,"name":"logout","type":"SQL","tableName":"player_sessions"}', 
+'{"canRead":false,"canWrite":false,"canUpdate":false,"canDelete":true}', NULL, NULL),
+
+('SQL', @api_group_id, 'profile', '{"id":5,"name":"profile","type":"SQL","tableName":"players"}', 
+'{"canRead":true,"canWrite":false,"canUpdate":false,"canDelete":false}', NULL, NULL),
+
+('SQL', @api_group_id, 'update', '{"id":6,"name":"update","type":"SQL","tableName":"players"}', 
+'{"canRead":false,"canWrite":false,"canUpdate":true,"canDelete":false}', NULL, NULL);
+```
+
+## 3. PHP Files
+
+Create the following PHP files in the specified locations:
+
+### /uploads/unirest/api/players/register.php
+```php
+<?php
+// Get the registration data
+$data = $UniREST->data;
+
+// Validate inputs
+if (empty($data->username) || empty($data->email) || empty($data->password)) {
+    $UniREST->sendError("Missing required fields");
+    return;
+}
+
+$username = $data->username;
+$email = $data->email;
+$password = $data->password;
+$display_name = isset($data->display_name) ? $data->display_name : $username;
+
+// Check if username or email already exists
+global $wpdb;
+$table_name = $wpdb->prefix . "tfur_players";
+$existing_user = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $table_name WHERE username = %s OR email = %s",
+        $username,
+        $email
+    )
+);
+
+if ($existing_user) {
+    $UniREST->sendError("Username or email already exists");
+    return;
+}
+
+// Hash the password
+$password_hash = password_hash($password, PASSWORD_DEFAULT);
+
+// Insert the new player
+$result = $wpdb->insert(
+    $table_name,
+    [
+        'username' => $username,
+        'email' => $email,
+        'password_hash' => $password_hash,
+        'display_name' => $display_name,
+        'registration_date' => current_time('mysql'),
+        'status' => 'active'
+    ]
+);
+
+if ($result) {
+    $player_id = $wpdb->insert_id;
+    $UniREST->sendReply(
+        [
+            'id' => $player_id,
+            'username' => $username,
+            'display_name' => $display_name
+        ],
+        "Registration successful"
+    );
+} else {
+    $UniREST->sendError("Registration failed: " . $wpdb->last_error);
+}
+?>
+```
+
+### /uploads/unirest/api/players/login.php
+```php
+<?php
+// Get the login data
+$data = $UniREST->data;
+
+// Validate inputs
+if (empty($data->login) || empty($data->password)) {
+    $UniREST->sendError("Missing login credentials");
+    return;
+}
+
+$login = $data->login; // Can be username or email
+$password = $data->password;
+
+// Find the user
+global $wpdb;
+$table_name = $wpdb->prefix . "tfur_players";
+$player = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $table_name WHERE username = %s OR email = %s",
+        $login,
+        $login
+    ),
+    ARRAY_A
+);
+
+if (!$player) {
+    $UniREST->sendError("User not found");
+    return;
+}
+
+// Verify password
+if (!password_verify($password, $player['password_hash'])) {
+    $UniREST->sendError("Invalid password");
+    return;
+}
+
+// Generate session token
+$session_token = bin2hex(random_bytes(32));
+$expires_at = date("Y-m-d H:i:s", strtotime("+7 days"));
+
+// Store session
+$sessions_table = $wpdb->prefix . "tfur_player_sessions";
+$wpdb->insert(
+    $sessions_table,
+    [
+        'player_id' => $player['id'],
+        'session_token' => $session_token,
+        'expires_at' => $expires_at,
+        'last_activity' => current_time('mysql')
+    ]
+);
+
+// Update last login
+$wpdb->update(
+    $table_name,
+    ['last_login' => current_time('mysql')],
+    ['id' => $player['id']]
+);
+
+// Return player data and token
+$UniREST->sendReply(
+    [
+        'id' => $player['id'],
+        'username' => $player['username'],
+        'email' => $player['email'],
+        'display_name' => $player['display_name'],
+        'session_token' => $session_token
+    ],
+    "Login successful"
+);
+?>
+```
+
+### /uploads/unirest/api/players/validate.php
+```php
+<?php
+// Get the token
+$data = $UniREST->data;
+
+if (empty($data->token)) {
+    $UniREST->sendError("No token provided");
+    return;
+}
+
+$token = $data->token;
+
+// Find the session
+global $wpdb;
+$sessions_table = $wpdb->prefix . "tfur_player_sessions";
+$session = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $sessions_table WHERE session_token = %s AND expires_at > %s",
+        $token,
+        current_time('mysql')
+    ),
+    ARRAY_A
+);
+
+if (!$session) {
+    $UniREST->sendError("Invalid or expired token");
+    return;
+}
+
+// Get the player
+$players_table = $wpdb->prefix . "tfur_players";
+$player = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $players_table WHERE id = %d",
+        $session['player_id']
+    ),
+    ARRAY_A
+);
+
+if (!$player) {
+    $UniREST->sendError("Player not found");
+    return;
+}
+
+// Update last activity
+$wpdb->update(
+    $sessions_table,
+    ['last_activity' => current_time('mysql')],
+    ['id' => $session['id']]
+);
+
+// Return player data
+$UniREST->sendReply(
+    [
+        'id' => $player['id'],
+        'username' => $player['username'],
+        'email' => $player['email'],
+        'display_name' => $player['display_name']
+    ],
+    "Session valid"
+);
+?>
+```
+
+### /uploads/unirest/api/players/logout.php
+```php
+<?php
+// Get the token
+$data = $UniREST->data;
+
+if (empty($data->token)) {
+    $UniREST->sendError("No token provided");
+    return;
+}
+
+$token = $data->token;
+
+// Delete the session
+global $wpdb;
+$sessions_table = $wpdb->prefix . "tfur_player_sessions";
+$wpdb->delete(
+    $sessions_table,
+    ['session_token' => $token]
+);
+
+$UniREST->sendReply([], "Logged out successfully");
+?>
+```
+
+### /uploads/unirest/api/players/profile.php
+```php
+<?php
+// Get the token
+$data = $UniREST->data;
+
+if (empty($data->token)) {
+    $UniREST->sendError("No token provided");
+    return;
+}
+
+$token = $data->token;
+
+// Find the session
+global $wpdb;
+$sessions_table = $wpdb->prefix . "tfur_player_sessions";
+$session = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $sessions_table WHERE session_token = %s AND expires_at > %s",
+        $token,
+        current_time('mysql')
+    ),
+    ARRAY_A
+);
+
+if (!$session) {
+    $UniREST->sendError("Invalid or expired token");
+    return;
+}
+
+// Get the player
+$players_table = $wpdb->prefix . "tfur_players";
+$player = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $players_table WHERE id = %d",
+        $session['player_id']
+    ),
+    ARRAY_A
+);
+
+if (!$player) {
+    $UniREST->sendError("Player not found");
+    return;
+}
+
+// Remove sensitive data
+unset($player['password_hash']);
+
+// Return player data
+$UniREST->sendReply($player, "Profile retrieved");
+?>
+```
+
+### /uploads/unirest/api/players/update.php
+```php
+<?php
+// Get the data
+$data = $UniREST->data;
+
+if (empty($data->token)) {
+    $UniREST->sendError("No token provided");
+    return;
+}
+
+$token = $data->token;
+$player_data = $data->player;
+
+// Find the session
+global $wpdb;
+$sessions_table = $wpdb->prefix . "tfur_player_sessions";
+$session = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $sessions_table WHERE session_token = %s AND expires_at > %s",
+        $token,
+        current_time('mysql')
+    ),
+    ARRAY_A
+);
+
+if (!$session) {
+    $UniREST->sendError("Invalid or expired token");
+    return;
+}
+
+// Prepare update data
+$update_data = [];
+if (isset($player_data->display_name)) {
+    $update_data['display_name'] = $player_data->display_name;
+}
+
+// Add other fields you want to allow updating
+// For security, don't allow updating username, email or password here
+// Create separate endpoints for those if needed
+
+if (empty($update_data)) {
+    $UniREST->sendError("No data to update");
+    return;
+}
+
+// Update the player
+$players_table = $wpdb->prefix . "tfur_players";
+$wpdb->update(
+    $players_table,
+    $update_data,
+    ['id' => $session['player_id']]
+);
+
+// Get updated player data
+$player = $wpdb->get_row(
+    $wpdb->prepare(
+        "SELECT * FROM $players_table WHERE id = %d",
+        $session['player_id']
+    ),
+    ARRAY_A
+);
+
+// Remove sensitive data
+unset($player['password_hash']);
+
+// Return updated player data
+$UniREST->sendReply($player, "Profile updated");
+?>
+```
+
+## 4. Unity C# Implementation
+
+Create this file in your Unity project:
+
+### PlayerAuth.cs
+```csharp
+using System;
+using UnityEngine;
+using TigerForge.UniREST;
+
+namespace TigerForge.UniREST.Demo
+{
+    public class PlayerAuth : MonoBehaviour
+    {
+        private UniREST uniREST = new UniREST();
+        private string sessionToken = "";
+        private bool isLoggedIn = false;
+        
+        // Player data
+        private int playerId;
+        private string username;
+        private string displayName;
+        
+        // Events
+        public event Action OnLoginSuccess;
+        public event Action<string> OnLoginFailed;
+        public event Action OnRegisterSuccess;
+        public event Action<string> OnRegisterFailed;
+        
+        // Register a new player
+        public void Register(string username, string email, string password, string displayName)
+        {
+            var player = new DB.Player
+            {
+                username = username,
+                email = email,
+                password = password,  // Note: This will be hashed on the server
+                display_name = displayName
+            };
+            
+            _ = uniREST
+                .Write(API.players.register)
+                .Data(player)
+                .OnDone(reply => {
+                    Debug.Log("Registration successful!");
+                    OnRegisterSuccess?.Invoke();
+                })
+                .OnError(reply => {
+                    Debug.LogError("REGISTER: " + reply.Error);
+                    OnRegisterFailed?.Invoke(reply.Error);
+                })
+                .Run();
+        }
+        
+        // Login player
+        public void Login(string usernameOrEmail, string password)
+        {
+            var loginData = new {
+                login = usernameOrEmail,
+                password = password
+            };
+            
+            _ = uniREST
+                .Read(API.players.login)
+                .Data(loginData)
+                .OnDone(reply => {
+                    var playerData = reply.GetRecord<DB.Player>();
+                    if (playerData != null)
+                    {
+                        playerId = playerData.id;
+                        username = playerData.username;
+                        displayName = playerData.display_name;
+                        sessionToken = reply.GetValue("session_token");
+                        isLoggedIn = true;
+                        
+                        // Save session token for future requests
+                        PlayerPrefs.SetString("SessionToken", sessionToken);
+                        
+                        Debug.Log($"Login successful! Welcome {displayName}");
+                        OnLoginSuccess?.Invoke();
+                    }
+                })
+                .OnError(reply => {
+                    Debug.LogError("LOGIN: " + reply.Error);
+                    OnLoginFailed?.Invoke(reply.Error);
+                })
+                .Run();
+        }
+        
+        // Check if session is valid
+        public void ValidateSession()
+        {
+            string savedToken = PlayerPrefs.GetString("SessionToken", "");
+            if (string.IsNullOrEmpty(savedToken)) return;
+            
+            _ = uniREST
+                .Read(API.players.validate)
+                .Data(new { token = savedToken })
+                .OnDone(reply => {
+                    var playerData = reply.GetRecord<DB.Player>();
+                    if (playerData != null)
+                    {
+                        playerId = playerData.id;
+                        username = playerData.username;
+                        displayName = playerData.display_name;
+                        sessionToken = savedToken;
+                        isLoggedIn = true;
+                        
+                        Debug.Log($"Session validated! Welcome back {displayName}");
+                        OnLoginSuccess?.Invoke();
+                    }
+                })
+                .OnError(reply => {
+                    // Session invalid or expired
+                    PlayerPrefs.DeleteKey("SessionToken");
+                })
+                .Run();
+        }
+        
+        // Logout
+        public void Logout()
+        {
+            if (!isLoggedIn) return;
+            
+            _ = uniREST
+                .Write(API.players.logout)
+                .Data(new { token = sessionToken })
+                .OnDone(reply => {
+                    isLoggedIn = false;
+                    sessionToken = "";
+                    PlayerPrefs.DeleteKey("SessionToken");
+                    Debug.Log("Logged out successfully");
+                })
+                .Run();
+        }
+        
+        // Get player profile
+        public void GetProfile(Action<DB.Player> callback)
+        {
+            if (!isLoggedIn)
+            {
+                Debug.LogError("Not logged in!");
+                return;
+            }
+            
+            _ = uniREST
+                .Read(API.players.profile)
+                .Data(new { token = sessionToken })
+                .OnDone(reply => {
+                    var playerData = reply.GetRecord<DB.Player>();
+                    callback?.Invoke(playerData);
+                })
+                .OnError(reply => {
+                    Debug.LogError("GET PROFILE: " + reply.Error);
+                })
+                .Run();
+        }
+        
+        // Update player profile
+        public void UpdateProfile(DB.Player updatedData)
+        {
+            if (!isLoggedIn)
+            {
+                Debug.LogError("Not logged in!");
+                return;
+            }
+            
+            updatedData.id = playerId;
+            
+            _ = uniREST
+                .Write(API.players.update)
+                .Data(new { 
+                    token = sessionToken,
+                    player = updatedData
+                })
+                .OnDone(reply => {
+                    Debug.Log("Profile updated successfully");
+                    // Update local data if needed
+                    if (!string.IsNullOrEmpty(updatedData.display_name))
+                        displayName = updatedData.display_name;
+                })
+                .OnError(reply => {
+                    Debug.LogError("UPDATE PROFILE: " + reply.Error);
+                })
+                .Run();
+        }
+        
+        // Getters
+        public bool IsLoggedIn() => isLoggedIn;
+        public int GetPlayerId() => playerId;
+        public string GetUsername() => username;
+        public string GetDisplayName() => displayName;
+    }
+}
+```
+
+### LoginUI.cs
+```csharp
+using UnityEngine;
+using UnityEngine.UI;
+using TMPro;
+
+namespace TigerForge.UniREST.Demo
+{
+    public class LoginUI : MonoBehaviour
+    {
+        [Header("References")]
+        [SerializeField] private PlayerAuth playerAuth;
+        
+        [Header("Login Panel")]
+        [SerializeField] private GameObject loginPanel;
+        [SerializeField] private TMP_InputField loginUsernameInput;
+        [SerializeField] private TMP_InputField loginPasswordInput;
+        [SerializeField] private Button loginButton;
+        [SerializeField] private Button showRegisterButton;
+        [SerializeField] private TextMeshProUGUI loginStatusText;
+        
+        [Header("Register Panel")]
+        [SerializeField] private GameObject registerPanel;
+        [SerializeField] private TMP_InputField registerUsernameInput;
+        [SerializeField] private TMP_InputField registerEmailInput;
+        [SerializeField] private TMP_InputField registerPasswordInput;
+        [SerializeField] private TMP_InputField registerConfirmPasswordInput;
+        [SerializeField] private TMP_InputField registerDisplayNameInput;
+        [SerializeField] private Button registerButton;
+        [SerializeField] private Button showLoginButton;
+        [SerializeField] private TextMeshProUGUI registerStatusText;
+        
+        [Header("Main Menu Panel")]
+        [SerializeField] private GameObject mainMenuPanel;
+        [SerializeField] private TextMeshProUGUI welcomeText;
+        [SerializeField] private Button logoutButton;
+        
+        private void Start()
+        {
+            if (playerAuth == null)
+                playerAuth = GetComponent<PlayerAuth>();
+                
+            // Set up event listeners
+            playerAuth.OnLoginSuccess += HandleLoginSuccess;
+            playerAuth.OnLoginFailed += HandleLoginFailed;
+            playerAuth.OnRegisterSuccess += HandleRegisterSuccess;
+            playerAuth.OnRegisterFailed += HandleRegisterFailed;
+            
+            // Set up button listeners
+            loginButton.onClick.AddListener(HandleLoginButtonClick);
+            showRegisterButton.onClick.AddListener(() => {
+                loginPanel.SetActive(false);
+                registerPanel.SetActive(true);
+            });
+            
+            registerButton.onClick.AddListener(HandleRegisterButtonClick);
+            showLoginButton.onClick.AddListener(() => {
+                registerPanel.SetActive(false);
+                loginPanel.SetActive(true);
+            });
+            
+            logoutButton.onClick.AddListener(() => {
+                playerAuth.Logout();
+                mainMenuPanel.SetActive(false);
+                loginPanel.SetActive(true);
+            });
+            
+            // Check for existing session
+            playerAuth.ValidateSession();
+            
+            // Show login panel by default
+            loginPanel.SetActive(true);
+            registerPanel.SetActive(false);
+            mainMenuPanel.SetActive(false);
+            
+            // Clear status texts
+            loginStatusText.text = "";
+            registerStatusText.text = "";
+        }
+        
+        private void HandleLoginButtonClick()
+        {
+            string username = loginUsernameInput.text;
+            string password = loginPasswordInput.text;
+            
+            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(password))
+            {
+                loginStatusText.text = "Please enter both username and password.";
+                return;
+            }
+            
+            loginStatusText.text = "Logging in...";
+            playerAuth.Login(username, password);
+        }
+        
+        private void HandleRegisterButtonClick()
+        {
+            string username = registerUsernameInput.text;
+            string email = registerEmailInput.text;
+            string password = registerPasswordInput.text;
+            string confirmPassword = registerConfirmPasswordInput.text;
+            string displayName = registerDisplayNameInput.text;
+            
+            // Validate inputs
+            if (string.IsNullOrEmpty(username) || string.IsNullOrEmpty(email) || 
+                string.IsNullOrEmpty(password) || string.IsNullOrEmpty(confirmPassword))
+            {
+                registerStatusText.text = "Please fill in all required fields.";
+                return;
+            }
+            
+            if (password != confirmPassword)
+            {
+                registerStatusText.text = "Passwords do not match.";
+                return;
+            }
+            
+            if (string.IsNullOrEmpty(displayName))
+                displayName = username;
+                
+            registerStatusText.text = "Registering...";
+            playerAuth.Register(username, email, password, displayName);
+        }
+        
+        private void HandleLoginSuccess()
+        {
+            loginStatusText.text = "Login successful!";
+            loginPanel.SetActive(false);
+            mainMenuPanel.SetActive(true);
+            welcomeText.text = $"Welcome, {playerAuth.GetDisplayName()}!";
+        }
+        
+        private void HandleLoginFailed(string error)
+        {
+            loginStatusText.text = $"Login failed: {error}";
+        }
+        
+        private void HandleRegisterSuccess()
+        {
+            registerStatusText.text = "Registration successful! You can now log in.";
+            
+            // Clear registration fields
+            registerUsernameInput.text = "";
+            registerEmailInput.text = "";
+            registerPasswordInput.text = "";
+            registerConfirmPasswordInput.text = "";
+            registerDisplayNameInput.text = "";
+            
+            // Switch to login panel after a delay
+            Invoke(nameof(SwitchToLoginAfterRegister), 2f);
+        }
+        
+        private void SwitchToLoginAfterRegister()
+        {
+            registerPanel.SetActive(false);
+            loginPanel.SetActive(true);
+        }
+        
+        private void HandleRegisterFailed(string error)
+        {
+            registerStatusText.text = $"Registration failed: {error}";
+        }
+    }
+}
+```
+
+## 5. Update UniRESTAPIScript.cs
+
+After setting up all the above components, you need to:
+
+1. Go to the UniREST WordPress plugin admin interface
+2. Navigate to the "Unity API Script" page
+3. Click the "GENERATE" button
+4. Copy the generated script
+5. Paste it into your Unity project's UniRESTAPIScript.cs file
+
+## 6. Final Steps
+
+1. Create a new scene in Unity with a Canvas
+2. Add the necessary UI elements (login panel, register panel, main menu panel)
+3. Add an empty GameObject and attach the PlayerAuth and LoginUI scripts to it
+4. Set up the references in the Inspector
+5. Test the authentication system
+
+## 7. Troubleshooting
+
+If you encounter any issues:
+
+1. Check the Unity Console for error messages
+2. Verify that all PHP files are in the correct locations
+3. Make sure the database tables were created correctly
+4. Ensure the API endpoints are properly configured in UniREST
+5. Check that the UniRESTAPIScript.cs file has been updated with the latest generated code

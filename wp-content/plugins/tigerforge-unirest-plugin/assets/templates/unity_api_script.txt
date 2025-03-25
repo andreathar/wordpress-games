@@ -1,0 +1,67 @@
+/*
+* =================================
+*  TIGERFORGE UniREST Client v.{{V}}
+* ---------------------------------
+*     Configuration settings
+* =================================
+*/
+
+#nullable enable
+
+using System;
+
+namespace TigerForge.UniREST
+{
+    public class UniRESTSettings
+    {
+        public static string Key1 = "{{KEY1}}";
+        public static string Key2 = "{{KEY2}}";
+        public static string AppAccount = "{{APP_ACCOUNT}}";
+
+#if UNITY_WEBGL
+        public static string UrlApi = "{{WEBGL_URL_API}}";
+        public static string UrlAssets = "{{WEBGL_URL_ASSETS}}";
+#else
+        public static string UrlApi = "{{URL_API}}";
+        public static string UrlAssets = "{{URL_ASSETS}}";
+#endif
+    }
+
+    ///<summary>
+    /// The APIs collection.
+    ///</summary>
+    public class API
+    {
+{{APIS}}
+    }
+    
+    ///<summary>
+    /// The Database Tables collection.
+    ///</summary>
+    [System.Serializable]
+    public class DB
+    {
+{{TABLES}}
+    }
+
+    ///<summary>
+    /// The WordPress User structure.
+    ///</summary>
+    [System.Serializable]
+    public class USER
+    {
+        public int ID = 0;
+        public string user_pass = "";
+        public string user_login = "";
+        public string user_nicename = "";
+        public string user_url = "";
+        public string user_email = "";
+        public string display_name = "";
+        public string nickname = "";
+        public string first_name = "";
+        public string last_name = "";
+        public string description = "";
+        public string role = "";
+    }
+
+}
